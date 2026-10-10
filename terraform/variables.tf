@@ -9,3 +9,9 @@ variable "project_name" {
   type        = string
   default     = "capstone3"
 }
+
+variable "image_tag" {
+  description = "Immutable ECR image tag to deploy"
+  type        = string
+  default     = "bootstrap"
+}
