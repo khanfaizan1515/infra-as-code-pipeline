@@ -1,0 +1,110 @@
+name: Zero-Touch ECS Deployment
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ap-south-1
+  AWS_ACCOUNT_ID: "977232999886"
+  ECR_REPOSITORY: capstone3-node-app
+  ECS_CLUSTER: capstone3-cluster
+  ECS_SERVICE: capstone3-service
+  TF_IN_AUTOMATION: "true"
+
+jobs:
+  deploy:
+    name: Test, Build and Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install dependencies and run tests
+        working-directory: app
+        run: |
+          npm ci
+          npm test
+
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::977232999886:role/Capstone3GitHubActionsRole
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Log in to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          if aws ecr describe-images \
+            --repository-name "$ECR_REPOSITORY" \
+            --image-ids imageTag="$IMAGE_TAG" >/dev/null 2>&1; then
+            echo "Image tag $IMAGE_TAG already exists; reusing it."
+          else
+            docker build \
+              -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
+              ./app
+
+            docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          fi
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.2"
+
+      - name: Initialize Terraform
+        working-directory: terraform
+        run: terraform init -input=false
+
+      - name: Check Terraform formatting
+        working-directory: terraform
+        run: terraform fmt -check -recursive
+
+      - name: Validate Terraform
+        working-directory: terraform
+        run: terraform validate
+
+      - name: Deploy infrastructure and application
+        working-directory: terraform
+        run: |
+          terraform apply \
+            -input=false \
+            -auto-approve \
+            -var="image_tag=${GITHUB_SHA}"
+
+      - name: Wait for ECS service stability
+        run: |
+          aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE"
+
+      - name: Verify ECS deployment
+        run: |
+          aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --query 'services[0].{status:status,running:runningCount,desired:desiredCount,events:events[0:3].message}' \
+            --output json
