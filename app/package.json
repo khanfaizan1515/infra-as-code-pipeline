@@ -1,0 +1,16 @@
+{
+  "name": "infra-as-code-pipeline-app",
+  "version": "1.0.0",
+  "description": "Sample application for Capstone Project 3",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "express": "^5.1.0"
+  },
+  "devDependencies": {
+    "supertest": "^7.1.4"
+  }
+}
