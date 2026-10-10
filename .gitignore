@@ -23,3 +23,14 @@ npm-debug.log
 .DS_Store
 .vscode/
 .idea/
+
+# Terraform generated files and state
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+
+# Saved Terraform plans
+tfplan
+*.tfplan
