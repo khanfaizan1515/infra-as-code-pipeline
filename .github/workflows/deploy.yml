@@ -22,6 +22,7 @@ jobs:
   deploy:
     name: Test, Lint, Build and Deploy
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
@@ -71,6 +72,30 @@ jobs:
       - name: Verify AWS identity
         run: aws sts get-caller-identity
 
+      - name: Capture previous ECS task definition
+        id: previous-task
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PREVIOUS_TASK_DEFINITION="$(
+            aws ecs describe-services \
+              --cluster "$ECS_CLUSTER" \
+              --services "$ECS_SERVICE" \
+              --region "$AWS_REGION" \
+              --query 'services[0].taskDefinition' \
+              --output text
+          )"
+
+          if [[ -z "$PREVIOUS_TASK_DEFINITION" ||
+                "$PREVIOUS_TASK_DEFINITION" == "None" ]]; then
+            echo "::error::Could not determine the previous ECS task definition."
+            exit 1
+          fi
+
+          echo "Previous task definition: $PREVIOUS_TASK_DEFINITION"
+          echo "task_definition=$PREVIOUS_TASK_DEFINITION" >> "$GITHUB_OUTPUT"
+
       - name: Log in to Amazon ECR
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
@@ -79,12 +104,14 @@ jobs:
         env:
           ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
+        shell: bash
         run: |
           set -euo pipefail
 
           if aws ecr describe-images \
             --repository-name "$ECR_REPOSITORY" \
-            --image-ids imageTag="$IMAGE_TAG" >/dev/null 2>&1; then
+            --image-ids imageTag="$IMAGE_TAG" \
+            --region "$AWS_REGION" >/dev/null 2>&1; then
             echo "Image tag $IMAGE_TAG already exists; reusing it."
           else
             docker build \
@@ -119,16 +146,100 @@ jobs:
             -auto-approve \
             -var="image_tag=${GITHUB_SHA}"
 
-      - name: Wait for ECS service stability
+      - name: Wait for ECS stability and verify application health
+        env:
+          PREVIOUS_TASK_DEFINITION: ${{ steps.previous-task.outputs.task_definition }}
+        shell: bash
         run: |
-          aws ecs wait services-stable \
-            --cluster "$ECS_CLUSTER" \
-            --services "$ECS_SERVICE"
+          set -euo pipefail
 
-      - name: Verify ECS deployment
+          rollback_to_previous() {
+            echo "::error::Deployment verification failed. Restoring the previous ECS task definition."
+
+            CURRENT_TASK_DEFINITION="$(
+              aws ecs describe-services \
+                --cluster "$ECS_CLUSTER" \
+                --services "$ECS_SERVICE" \
+                --region "$AWS_REGION" \
+                --query 'services[0].taskDefinition' \
+                --output text
+            )"
+
+            if [[ "$CURRENT_TASK_DEFINITION" != "$PREVIOUS_TASK_DEFINITION" ]]; then
+              aws ecs update-service \
+                --cluster "$ECS_CLUSTER" \
+                --service "$ECS_SERVICE" \
+                --region "$AWS_REGION" \
+                --task-definition "$PREVIOUS_TASK_DEFINITION"
+            else
+              echo "The service already references the previous task definition."
+            fi
+
+            echo "Waiting for the rollback to stabilize..."
+
+            if aws ecs wait services-stable \
+              --cluster "$ECS_CLUSTER" \
+              --services "$ECS_SERVICE" \
+              --region "$AWS_REGION"; then
+              echo "The ECS service is stable after rollback."
+            else
+              echo "::error::Rollback was requested, but service stability was not confirmed."
+              aws ecs describe-services \
+                --cluster "$ECS_CLUSTER" \
+                --services "$ECS_SERVICE" \
+                --region "$AWS_REGION" \
+                --query 'services[0].{Status:status,Desired:desiredCount,Running:runningCount,TaskDefinition:taskDefinition,Deployments:deployments[*].rolloutState}' \
+                --output json || true
+            fi
+
+            exit 1
+          }
+
+          echo "Waiting for ECS deployment stability..."
+
+          if ! aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --region "$AWS_REGION"; then
+            echo "::error::ECS did not become stable."
+            rollback_to_previous
+          fi
+
+          ALB_DNS="$(
+            terraform -chdir=terraform output -raw alb_dns_name
+          )"
+
+          HEALTH_URL="http://${ALB_DNS}/health"
+          DEADLINE=$((SECONDS + 300))
+
+          echo "Checking application health for up to five minutes: $HEALTH_URL"
+
+          while (( SECONDS < DEADLINE )); do
+            RESPONSE="$(
+              curl --fail --silent --show-error \
+                --max-time 5 \
+                "$HEALTH_URL" 2>/dev/null || true
+            )"
+
+            if [[ "$RESPONSE" == '{"status":"healthy"}' ]]; then
+              echo "Application health check passed."
+              echo "Health response: $RESPONSE"
+              exit 0
+            fi
+
+            echo "Health check has not passed yet; retrying..."
+            sleep 5
+          done
+
+          echo "::error::Application health check did not pass within five minutes."
+          rollback_to_previous
+
+      - name: Verify final ECS deployment
+        if: always()
         run: |
           aws ecs describe-services \
             --cluster "$ECS_CLUSTER" \
             --services "$ECS_SERVICE" \
-            --query 'services[0].{Status:status,Desired:desiredCount,Running:runningCount,Pending:pendingCount,TaskDefinition:taskDefinition}' \
-            --output table
+            --region "$AWS_REGION" \
+            --query 'services[0].{Status:status,Desired:desiredCount,Running:runningCount,Pending:pendingCount,TaskDefinition:taskDefinition,CircuitBreaker:deploymentConfiguration.deploymentCircuitBreaker,Deployments:deployments[*].rolloutState}' \
+            --output json
