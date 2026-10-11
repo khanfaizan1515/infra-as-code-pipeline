@@ -55,11 +55,11 @@ resource "aws_security_group" "app" {
   vpc_id      = module.networking.vpc_id
 
   ingress {
-    description = "Node.js application port"
-    from_port   = 3001
-    to_port     = 3001
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    description     = "Application traffic from the ALB"
+    from_port       = 3001
+    to_port         = 3001
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb.id]
   }
 
   egress {
@@ -88,6 +88,17 @@ resource "aws_ecs_task_definition" "app" {
       name      = "node-app"
       image     = "${aws_ecr_repository.app.repository_url}:${var.image_tag}"
       essential = true
+
+      healthCheck = {
+        command = [
+          "CMD-SHELL",
+          "node -e \"require('http').get('http://127.0.0.1:3001/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))\""
+        ]
+        interval    = 30
+        timeout     = 5
+        retries     = 3
+        startPeriod = 20
+      }
 
       portMappings = [{
         containerPort = 3001
@@ -120,8 +131,14 @@ resource "aws_ecs_service" "app" {
   name            = "${var.project_name}-service"
   cluster         = aws_ecs_cluster.main.id
   task_definition = aws_ecs_task_definition.app.arn
-  desired_count   = 1
+  desired_count   = 2
   launch_type     = "FARGATE"
+
+  load_balancer {
+    target_group_arn = aws_lb_target_group.app.arn
+    container_name   = "node-app"
+    container_port   = 3001
+  }
 
   network_configuration {
     subnets          = module.networking.public_subnet_ids
@@ -129,6 +146,8 @@ resource "aws_ecs_service" "app" {
     assign_public_ip = true
   }
 
-  deployment_minimum_healthy_percent = 0
-  deployment_maximum_percent         = 100
+  deployment_minimum_healthy_percent = 50
+  deployment_maximum_percent         = 200
+
+  depends_on = [aws_lb_listener.http]
 }
