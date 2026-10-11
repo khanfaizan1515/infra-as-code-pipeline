@@ -93,8 +93,24 @@ jobs:
             exit 1
           fi
 
+          PREVIOUS_IMAGE="$(
+            aws ecs describe-task-definition \
+              --task-definition "$PREVIOUS_TASK_DEFINITION" \
+              --region "$AWS_REGION" \
+              --query 'taskDefinition.containerDefinitions[0].image' \
+              --output text
+          )"
+          PREVIOUS_IMAGE_TAG="${PREVIOUS_IMAGE##*:}"
+
+          if [[ -z "$PREVIOUS_IMAGE_TAG" || "$PREVIOUS_IMAGE_TAG" == "None" ]]; then
+            echo "::error::Could not determine the previous image tag."
+            exit 1
+          fi
+
           echo "Previous task definition: $PREVIOUS_TASK_DEFINITION"
+          echo "Previous image tag: $PREVIOUS_IMAGE_TAG"
           echo "task_definition=$PREVIOUS_TASK_DEFINITION" >> "$GITHUB_OUTPUT"
+          echo "image_tag=$PREVIOUS_IMAGE_TAG" >> "$GITHUB_OUTPUT"
 
       - name: Log in to Amazon ECR
         id: ecr-login
@@ -149,30 +165,21 @@ jobs:
       - name: Wait for ECS stability and verify application health
         env:
           PREVIOUS_TASK_DEFINITION: ${{ steps.previous-task.outputs.task_definition }}
+          PREVIOUS_IMAGE_TAG: ${{ steps.previous-task.outputs.image_tag }}
+          EXPECTED_IMAGE_TAG: ${{ github.sha }}
         shell: bash
         run: |
           set -euo pipefail
 
           rollback_to_previous() {
-            echo "::error::Deployment verification failed. Restoring the previous ECS task definition."
+            echo "::error::Deployment verification failed. Restoring the previous image through Terraform."
 
-            CURRENT_TASK_DEFINITION="$(
-              aws ecs describe-services \
-                --cluster "$ECS_CLUSTER" \
-                --services "$ECS_SERVICE" \
-                --region "$AWS_REGION" \
-                --query 'services[0].taskDefinition' \
-                --output text
-            )"
-
-            if [[ "$CURRENT_TASK_DEFINITION" != "$PREVIOUS_TASK_DEFINITION" ]]; then
-              aws ecs update-service \
-                --cluster "$ECS_CLUSTER" \
-                --service "$ECS_SERVICE" \
-                --region "$AWS_REGION" \
-                --task-definition "$PREVIOUS_TASK_DEFINITION"
-            else
-              echo "The service already references the previous task definition."
+            if ! terraform -chdir=terraform apply \
+              -input=false \
+              -auto-approve \
+              -var="image_tag=$PREVIOUS_IMAGE_TAG"; then
+              echo "::error::Terraform rollback failed. Manual investigation is required."
+              exit 1
             fi
 
             echo "Waiting for the rollback to stabilize..."
@@ -181,7 +188,32 @@ jobs:
               --cluster "$ECS_CLUSTER" \
               --services "$ECS_SERVICE" \
               --region "$AWS_REGION"; then
-              echo "The ECS service is stable after rollback."
+              ROLLBACK_TASK_DEFINITION="$(
+                aws ecs describe-services \
+                  --cluster "$ECS_CLUSTER" \
+                  --services "$ECS_SERVICE" \
+                  --region "$AWS_REGION" \
+                  --query 'services[0].taskDefinition' \
+                  --output text
+              )"
+
+              ROLLBACK_IMAGE="$(
+                aws ecs describe-task-definition \
+                  --task-definition "$ROLLBACK_TASK_DEFINITION" \
+                  --region "$AWS_REGION" \
+                  --query 'taskDefinition.containerDefinitions[0].image' \
+                  --output text
+              )"
+              ROLLBACK_IMAGE_TAG="${ROLLBACK_IMAGE##*:}"
+
+              if [[ "$ROLLBACK_IMAGE_TAG" != "$PREVIOUS_IMAGE_TAG" ]]; then
+                echo "::error::Rollback stability check passed, but the previous image was not restored."
+                echo "Expected image tag: $PREVIOUS_IMAGE_TAG"
+                echo "Actual image tag:   $ROLLBACK_IMAGE_TAG"
+                exit 1
+              fi
+
+              echo "Rollback verified. ECS is stable on the previous image."
             else
               echo "::error::Rollback was requested, but service stability was not confirmed."
               aws ecs describe-services \
@@ -192,6 +224,7 @@ jobs:
                 --output json || true
             fi
 
+            # Keep the workflow failed even if recovery succeeds.
             exit 1
           }
 
@@ -202,6 +235,31 @@ jobs:
             --services "$ECS_SERVICE" \
             --region "$AWS_REGION"; then
             echo "::error::ECS did not become stable."
+            rollback_to_previous
+          fi
+
+          CURRENT_TASK_DEFINITION="$(
+            aws ecs describe-services \
+              --cluster "$ECS_CLUSTER" \
+              --services "$ECS_SERVICE" \
+              --region "$AWS_REGION" \
+              --query 'services[0].taskDefinition' \
+              --output text
+          )"
+
+          CURRENT_IMAGE="$(
+            aws ecs describe-task-definition \
+              --task-definition "$CURRENT_TASK_DEFINITION" \
+              --region "$AWS_REGION" \
+              --query 'taskDefinition.containerDefinitions[0].image' \
+              --output text
+          )"
+          CURRENT_IMAGE_TAG="${CURRENT_IMAGE##*:}"
+
+          if [[ "$CURRENT_IMAGE_TAG" != "$EXPECTED_IMAGE_TAG" ]]; then
+            echo "::error::ECS is stable but is not running the image for this commit."
+            echo "Expected: $EXPECTED_IMAGE_TAG"
+            echo "Actual:   $CURRENT_IMAGE_TAG"
             rollback_to_previous
           fi
 
